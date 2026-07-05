@@ -1,0 +1,371 @@
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <WebServer.h>
+#include <time.h>
+#include <BleKeyboard.h>
+#include <BLEDevice.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Wire.h>
+#include <ESPmDNS.h>
+
+/*** ---------- USER CONFIG ---------- ***/
+const char* TZ_INFO = "CST6CDT,M3.2.0/2,M11.1.0/2";
+
+/*** ---------- PINS ---------- ***/
+#define LED_BT       16
+#define LED_MIC      27
+#define LED_CAM      14
+
+#define BTN_MODE     19
+#define BTN_PLUS     26
+#define BTN_MINUS    33
+#define BTN_YT       17
+#define BTN_MIC      5
+#define BTN_CAM      12
+#define POT_PIN      34
+#define OLED_SDA     21
+#define OLED_SCL     22
+#define OLED_ADDR    0x3C
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+/*** ---------- GLOBALS ---------- ***/
+BleKeyboard bleKeyboard("ESP32 Clock Deck", "ESP32", 100);
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+WebServer server(80);
+
+enum Mode { MODE_CLOCK = 0, MODE_TIMER = 1, MODE_STOPWATCH = 2 };
+Mode currentMode = MODE_CLOCK;
+
+bool timerRunning = false, timerDone = false;
+int32_t timerSeconds = 0;
+uint32_t lastSecondTick = 0, flashStart = 0;
+bool swRunning = false;
+uint32_t swStartMillis = 0, swElapsedMs = 0;
+
+/*** ---------- VOLUME ---------- ***/
+static const int VOL_READS = 7;
+static const int VOL_REFRESH_MS = 40;
+int lastVolumePercent = 0;
+bool volumeInitialized = false;
+
+/*** ---------- VIDEO CONF STATE ---------- ***/
+int vcPlatform = 0;              // 0=Zoom, 1=Teams
+unsigned long vcOverlayUntil = 0;
+bool lastYTState = HIGH;
+bool micState = false, videoState = false;
+
+/*** ---------- UTILS ---------- ***/
+String two(int v){char b[3];snprintf(b,sizeof(b),"%02d",v);return String(b);}
+bool getLocalTimeSafe(struct tm *info){return getLocalTime(info,1000);}
+void drawCentered(const String &line,int y,int size=2){
+  display.setTextSize(size);
+  int16_t x1,y1;uint16_t w,h;
+  display.getTextBounds(line,0,0,&x1,&y1,&w,&h);
+  int x=(SCREEN_WIDTH-(int)w)/2;
+  display.setCursor(x,y);display.print(line);
+}
+
+/*** ---------- BLE SHORTCUT HELPERS ---------- ***/
+void sendZoom(char key){
+  if (!bleKeyboard.isConnected()) return;
+  bleKeyboard.press(KEY_LEFT_ALT);
+  delay(80);
+  bleKeyboard.press(key);
+  delay(80);
+  bleKeyboard.release(key);
+  delay(20);
+  bleKeyboard.release(KEY_LEFT_ALT);
+}
+
+void sendTeams(char key){
+  if (!bleKeyboard.isConnected()) return;
+  bleKeyboard.press(KEY_LEFT_CTRL);
+  delay(20);
+  bleKeyboard.press(KEY_LEFT_SHIFT);
+  delay(80);
+  bleKeyboard.press(key);
+  delay(80);
+  bleKeyboard.releaseAll();
+}
+
+/*** ---------- VIDEO CONF HANDLERS ---------- ***/
+void showVCOverlay(){
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  String name = (vcPlatform == 0) ? "ZOOM" : "TEAMS";
+  drawCentered(name, 24, 2);
+  display.display();
+  vcOverlayUntil = millis() + 2000;
+}
+
+void handleConferenceButtons(){
+  // 🎤 Mic → GPIO5, LED27
+  if (digitalRead(BTN_MIC) == LOW) {
+    micState = !micState;
+    digitalWrite(LED_MIC, micState ? HIGH : LOW);
+
+    if (bleKeyboard.isConnected()) {
+      if (vcPlatform == 0) sendZoom('a');
+      else sendTeams('m');
+    }
+    delay(300);
+  }
+
+  // Camera → GPIO12, LED14
+  if (digitalRead(BTN_CAM) == LOW) {
+    videoState = !videoState;
+    digitalWrite(LED_CAM, videoState ? HIGH : LOW);
+
+    if (bleKeyboard.isConnected()) {
+      if (vcPlatform == 0) sendZoom('v');
+      else sendTeams('o');
+    }
+    delay(300);
+  }
+}
+
+/*** ---------- YOUTUBE + VC MODE BUTTON ---------- ***/
+void handleYouTubeButton(){
+  bool nowYT = digitalRead(BTN_YT);
+  if (lastYTState == HIGH && nowYT == LOW){
+    unsigned long pressedAt = millis();
+    while (digitalRead(BTN_YT) == LOW && millis() - pressedAt < 600) delay(10);
+    unsigned long held = millis() - pressedAt;
+
+    if (held < 600){
+      if (bleKeyboard.isConnected()) bleKeyboard.write('k');   // play/pause
+    } else {
+      vcPlatform = (vcPlatform + 1) % 2;                       // switch Zoom/Teams
+      showVCOverlay();
+    }
+    delay(200);
+  }
+  lastYTState = nowYT;
+}
+
+/*** ---------- CLOCK / TIMER / STOPWATCH ---------- ***/
+String modeName(Mode m){
+  switch(m){
+    case MODE_CLOCK: return "CLOCK";
+    case MODE_TIMER: return "TIMER";
+    case MODE_STOPWATCH: return "STOPWATCH";
+  } return "UNKNOWN";
+}
+void resetTimerStopwatch(){
+  timerRunning=false; timerDone=false; timerSeconds=0; lastSecondTick=millis();
+  swRunning=false; swElapsedMs=0; swStartMillis=millis();
+}
+void setMode(Mode m){ currentMode=m; resetTimerStopwatch(); }
+void cycleMode(){ Mode next=(Mode)(((int)currentMode+1)%3); setMode(next); }
+
+void renderClock(){
+  struct tm t; display.clearDisplay(); display.setTextColor(SSD1306_WHITE);
+  drawCentered("CLOCK",0,1);
+  if(getLocalTimeSafe(&t)){
+    const char* wd[]={"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+    String dateLine=String(wd[t.tm_wday])+" "+String(t.tm_mon+1)+"-"+String(t.tm_mday)+"-"+String(t.tm_year+1900);
+    drawCentered(dateLine,18,1);
+    int hour=t.tm_hour%12;if(hour==0)hour=12;
+    String ampm=(t.tm_hour>=12)?"PM":"AM";
+    String tLine=two(hour)+":"+two(t.tm_min)+":"+two(t.tm_sec)+" "+ampm;
+    drawCentered(tLine,38,1);
+  } else drawCentered("Syncing Time...",28,1);
+  display.display();
+}
+
+void renderTimer(){
+  if(timerRunning && millis()-lastSecondTick>=1000){
+    lastSecondTick+=1000;
+    if(timerSeconds>0) timerSeconds--;
+    if(timerSeconds==0){ timerRunning=false; timerDone=true; flashStart=millis(); }
+  }
+  int s=timerSeconds,h=s/3600,m=(s%3600)/60,sec=s%60;
+  display.clearDisplay(); display.setTextColor(SSD1306_WHITE);
+  drawCentered("TIMER",0,1);
+  drawCentered(two(h)+":"+two(m)+":"+two(sec),20,2);
+  if(timerDone) drawCentered("DONE!",50,1);
+  else drawCentered(timerRunning?"RUNNING":"STOPPED",50,1);
+  display.display();
+}
+
+void renderStopwatch(){
+  uint32_t e=swRunning?(millis()-swStartMillis):swElapsedMs;
+  int s=e/1000,h=s/3600,m=(s%3600)/60,sec=s%60;
+  display.clearDisplay(); display.setTextColor(SSD1306_WHITE);
+  drawCentered("STOPWATCH",0,1);
+  drawCentered(two(h)+":"+two(m)+":"+two(sec),20,2);
+  drawCentered(swRunning?"RUNNING":"STOPPED",50,1);
+  display.display();
+}
+
+/*** ---------- BACKGROUND VOLUME ---------- ***/
+int readMedianADC(){
+  int vals[VOL_READS];
+  for(int i=0;i<VOL_READS;i++){vals[i]=analogRead(POT_PIN);delayMicroseconds(200);}
+  for(int i=1;i<VOL_READS;i++){int key=vals[i];int j=i-1;while(j>=0&&vals[j]>key){vals[j+1]=vals[j];j--;}vals[j+1]=key;}
+  return vals[VOL_READS/2];
+}
+void setVolumeToZeroOnConnect(){
+  if(!bleKeyboard.isConnected()) return;
+  for(int i=0;i<100;i++){bleKeyboard.write(KEY_MEDIA_VOLUME_DOWN);delay(4);}
+  lastVolumePercent=0;
+}
+void volumeBackgroundUpdate(){
+  static unsigned long t0=0;
+  if(millis()-t0<VOL_REFRESH_MS)return;t0=millis();
+  if(bleKeyboard.isConnected()&&!volumeInitialized){setVolumeToZeroOnConnect();volumeInitialized=true;}
+  int raw=readMedianADC();raw=constrain(raw,0,4095);
+  int mappedPercent=map(raw,0,4095,0,100);mappedPercent=constrain(mappedPercent,0,100);
+  if(mappedPercent<=1)mappedPercent=0;
+  int diff=mappedPercent-lastVolumePercent;
+  if(diff!=0&&bleKeyboard.isConnected()){
+    float scale=0.5f;int steps=abs((int)(diff*scale));if(steps<1)steps=1;
+    if(mappedPercent==0&&diff<0)steps=5;
+    if(diff>0){for(int i=0;i<steps;i++)bleKeyboard.write(KEY_MEDIA_VOLUME_UP);}
+    else{for(int i=0;i<steps;i++)bleKeyboard.write(KEY_MEDIA_VOLUME_DOWN);}
+    lastVolumePercent=mappedPercent;
+  } else lastVolumePercent=mappedPercent;
+}
+
+/*** ---------- WIFI + DASHBOARD ---------- ***/
+void showSetupScreen(const String& apName){
+  display.clearDisplay();display.setTextColor(SSD1306_WHITE);
+  drawCentered("Setup Wi-Fi",0,1);
+  drawCentered("Wi-Fi: "+apName,16,1);
+  drawCentered("PW: esp32setup",28,1);
+  drawCentered("Go to 192.168.4.1",44,1);
+  display.display();
+}
+void showConnectedScreen(const String& addr){
+  display.clearDisplay();display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);display.setCursor(0,8);
+  display.println("Connected!");
+  display.print("SSID: ");display.println(WiFi.SSID());
+  display.print("IP: ");display.println(WiFi.localIP());
+  display.print("URL: ");display.println(addr);
+  display.display();
+}
+String htmlPageRoot(){
+  String s="<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  s+="<title>ESP32 Clock Deck</title><style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:24px;} .card{max-width:520px;border:1px solid #ddd;border-radius:12px;padding:20px;} h1{margin:0 0 12px} .row{margin:8px 0} a.btn{display:inline-block;padding:10px 14px;border-radius:8px;background:#ef4444;color:#fff;text-decoration:none}</style></head><body><div class='card'>";
+  s+="<h1>ESP32 Clock Deck</h1>";
+  s+="<div class='row'><b>Connected to:</b> "+WiFi.SSID()+"</div>";
+  s+="<div class='row'><b>Device IP:</b> "+WiFi.localIP().toString()+"</div>";
+  s+="<div class='row'><b>Access via:</b> <a href='http://clockdeck.local'>clockdeck.local</a></div>";
+  s+="<div class='row'><b>Current Mode:</b> "+String(modeName(currentMode))+"</div>";
+  s+="<div class='row' style='margin-top:16px'><a class='btn' href='/reset' onclick='return confirm(\"Reset Wi-Fi and reboot?\")'>Reset Wi-Fi</a></div>";
+  s+="<p style='color:#666;margin-top:16px'>Use device buttons to control modes. This page is read-only.</p></div></body></html>";
+  return s;
+}
+void handleRoot(){server.send(200,"text/html",htmlPageRoot());}
+void handleReset(){
+  server.send(200,"text/html","<html><body><h3>Resetting Wi-Fi…</h3><p>Device will reboot.</p></body></html>");
+  delay(500);WiFi.disconnect(true,true);delay(200);ESP.restart();
+}
+
+/*** ---------- SETUP ---------- ***/
+void setup(){
+  pinMode(LED_BT,OUTPUT);
+  pinMode(LED_MIC,OUTPUT);
+  pinMode(LED_CAM,OUTPUT);
+  digitalWrite(LED_BT,LOW);
+  digitalWrite(LED_MIC,LOW);
+  digitalWrite(LED_CAM,LOW);
+
+  pinMode(BTN_MODE,INPUT_PULLUP);
+  pinMode(BTN_PLUS,INPUT_PULLUP);
+  pinMode(BTN_MINUS,INPUT_PULLUP);
+  pinMode(BTN_YT,INPUT_PULLUP);
+  pinMode(BTN_MIC,INPUT_PULLUP);
+  pinMode(BTN_CAM,INPUT_PULLUP);
+
+  Wire.begin(OLED_SDA,OLED_SCL);
+  display.begin(SSD1306_SWITCHCAPVCC,OLED_ADDR);
+  display.setRotation(2);display.clearDisplay();display.display();
+
+  WiFiManager wm;
+  String apName="ESP32-Setup-"+String((uint32_t)ESP.getEfuseMac(),HEX).substring(4);
+  showSetupScreen(apName);
+  if(!wm.autoConnect(apName.c_str(),"esp32setup")){
+    drawCentered("Setup failed!",28,1);display.display();delay(2000);ESP.restart();
+  }
+
+  configTzTime(TZ_INFO,"pool.ntp.org","time.nist.gov");
+
+  String mdnsName="clockdeck";String shownAddr=WiFi.localIP().toString();
+  if(MDNS.begin(mdnsName.c_str())){MDNS.addService("http","tcp",80);shownAddr="http://"+mdnsName+".local";}
+  showConnectedScreen(shownAddr);
+
+  server.on("/",handleRoot);
+  server.on("/reset",handleReset);
+  server.begin();
+
+  BLEDevice::init("ESP32 Clock Deck");
+  BLEDevice::setPower(ESP_PWR_LVL_P7);
+  bleKeyboard.begin();
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  setMode(MODE_CLOCK);
+}
+
+/*** ---------- LOOP ---------- ***/
+void loop(){
+  server.handleClient();
+  digitalWrite(LED_BT,bleKeyboard.isConnected()?HIGH:LOW);
+
+  if(timerDone){
+    unsigned long e=millis()-flashStart;
+    if(e<5000)digitalWrite(LED_BT,(e/200)%2);
+    else{timerDone=false;digitalWrite(LED_BT,bleKeyboard.isConnected());}
+  }
+
+  if(millis()<vcOverlayUntil){
+    // Overlay active; skip normal rendering
+  } else {
+    switch(currentMode){
+      case MODE_CLOCK: renderClock(); break;
+      case MODE_TIMER: renderTimer(); break;
+      case MODE_STOPWATCH: renderStopwatch(); break;
+    }
+  }
+
+  // --- Mode switch ---
+  static bool lastMode=HIGH;
+  bool modeNow=digitalRead(BTN_MODE);
+  if(lastMode==HIGH && modeNow==LOW){cycleMode();delay(200);}
+  lastMode=modeNow;
+
+  // --- Timer controls ---
+  if(currentMode==MODE_TIMER){
+    bool plus=digitalRead(BTN_PLUS)==LOW;
+    bool minus=digitalRead(BTN_MINUS)==LOW;
+    if(!timerRunning){
+      if(plus&&!minus){timerSeconds=min(timerSeconds+60,359999);delay(160);}
+      if(minus&&!plus){timerSeconds=max(timerSeconds-60,0);delay(160);}
+      if(plus&&minus){timerRunning=true;lastSecondTick=millis();delay(300);}
+    }else if(plus&&minus){timerRunning=false;delay(300);}
+  }
+
+  // --- Stopwatch controls ---
+  if(currentMode==MODE_STOPWATCH){
+    bool plus=digitalRead(BTN_PLUS)==LOW;
+    bool minus=digitalRead(BTN_MINUS)==LOW;
+    if(plus&&!swRunning){swRunning=true;swStartMillis=millis()-swElapsedMs;delay(160);}
+    if(minus&&swRunning){swElapsedMs=millis()-swStartMillis;swRunning=false;delay(160);}
+  }
+
+  // --- YouTube / VC Mode Button ---
+  handleYouTubeButton();
+
+  // --- Conference Buttons (Mic/Camera) ---
+  handleConferenceButtons();
+
+  // --- Background Volume ---
+  volumeBackgroundUpdate();
+
+  delay(50);
+}
+
